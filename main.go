@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -207,11 +208,12 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			status = http.StatusBadRequest
 			return
 		}
-		museChat, streaming := false, false
+		museChat, streaming, chatWire, clientStream := false, false, false, false
 		requestedModel := ""
 		if decoded {
 			requestedModel, _ = requestBody["model"].(string)
 			streaming, _ = requestBody["stream"].(bool)
+			clientStream = streaming
 		}
 		switch {
 		case strings.Contains(r.URL.Path, "/v1/responses"):
@@ -247,7 +249,12 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			return
 		default:
 			if decoded {
-				if augmentChatTools(requestBody) {
+				toolsChanged := augmentChatTools(requestBody)
+				if strings.Contains(r.URL.Path, "/v1/chat/completions") {
+					chatWire = true
+					requestBody["stream"] = true
+				}
+				if toolsChanged || chatWire {
 					updated, marshalErr := json.Marshal(requestBody)
 					if marshalErr != nil {
 						http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -358,13 +365,32 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				status, _ = writeResponsesAsChat(w, resp, requestedModel, false, replay)
 				return
 			}
+			isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+			if chatWire && !clientStream && isSSE && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
+				completion, aggErr := aggregateChatStream(resp.Body, requestedModel)
+				_ = resp.Body.Close()
+				if aggErr != nil {
+					if errors.Is(aggErr, errEmptyChatStream) && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+						retryLog(attempt, "empty_chat_stream", session)
+						continue
+					}
+					status = writeJSONError(w, aggErr.Error())
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(completion)
+				status = http.StatusOK
+				return
+			}
+
 			for key, values := range resp.Header {
 				for _, value := range values {
 					w.Header().Add(key, value)
 				}
 			}
 			status = resp.StatusCode
-			isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 			if streaming && isSSE {
 				writer := newSerializedStreamWriter(w, clientKeepAliveInterval)
 				resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)

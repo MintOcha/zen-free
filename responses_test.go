@@ -605,8 +605,8 @@ func TestProxyHandlerUnrelatedModelPassesThrough(t *testing.T) {
 	if upstreamPath != "/v1/chat/completions?x=2" {
 		t.Fatalf("unrelated model path = %q", upstreamPath)
 	}
-	if upstreamBody["model"] != "gpt-4o" || upstreamBody["stream"] != false {
-		t.Fatalf("pass-through body changed unexpectedly: %#v", upstreamBody)
+	if upstreamBody["model"] != "gpt-4o" || upstreamBody["stream"] != true {
+		t.Fatalf("chat request should force stream true upstream: %#v", upstreamBody)
 	}
 	tools := array(t, upstreamBody["tools"])
 	if len(tools) != 4 || object(t, tools[0])["function"] == nil {
