@@ -208,7 +208,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			status = http.StatusBadRequest
 			return
 		}
-		museChat, streaming, chatWire, clientStream := false, false, false, false
+		museChat, streaming, chatWire, responsesWire, clientStream := false, false, false, false, false
 		requestedModel := ""
 		if decoded {
 			requestedModel, _ = requestBody["model"].(string)
@@ -217,10 +217,15 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 		}
 		switch {
 		case strings.Contains(r.URL.Path, "/v1/responses"):
+			responsesWire = true
 			if decoded {
+				forcedStream := requestBody["stream"] != true
+				if forcedStream {
+					requestBody["stream"] = true
+				}
 				toolsChanged := augmentFlatTools(requestBody)
 				choiceChanged := sanitizeResponsesToolChoice(requestBody)
-				if toolsChanged || choiceChanged {
+				if forcedStream || toolsChanged || choiceChanged {
 					updated, marshalErr := json.Marshal(requestBody)
 					if marshalErr != nil {
 						http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -384,6 +389,25 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				if aggErr != nil {
 					if errors.Is(aggErr, errEmptyChatStream) && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 						retryLog(attempt, "empty_chat_stream", session)
+						continue
+					}
+					status = writeJSONError(w, aggErr.Error())
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(completion)
+				status = http.StatusOK
+				return
+			}
+			if responsesWire && !clientStream && isSSE && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
+				completion, aggErr := aggregateResponsesStream(resp.Body)
+				_ = resp.Body.Close()
+				cancelAttempt()
+				if aggErr != nil {
+					if errors.Is(aggErr, errEmptyResponsesStream) && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+						retryLog(attempt, "empty_responses_stream", session)
 						continue
 					}
 					status = writeJSONError(w, aggErr.Error())
