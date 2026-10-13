@@ -14,17 +14,17 @@ import (
 var (
 	dialTimeout             = 15 * time.Second
 	tlsHandshakeTimeout     = 10 * time.Second
-	responseHeaderTimeout   = 90 * time.Second
+	responseHeaderTimeout   = 300 * time.Second
 	idleConnTimeout         = 90 * time.Second
 	expectContinueTimeout   = 1 * time.Second
 	maxIdleConns            = 32
 	maxIdleConnsPerHost     = 16
-	upstreamIdleTimeout     = 90 * time.Second
-	clientKeepAliveInterval = 60 * time.Second
-	maxAttempts             = 3
-	retryBackoffs           = []time.Duration{1 * time.Second, 2 * time.Second}
-	retryAfterCap           = 5 * time.Second
-	retryLoopBudget         = 120 * time.Second
+	upstreamIdleTimeout     = 300 * time.Second
+	clientKeepAliveInterval = 15 * time.Second
+	maxAttempts             = 8
+	retryBackoffs           = []time.Duration{1 * time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+	retryAfterCap           = 30 * time.Second
+	retryLoopBudget         = 300 * time.Second
 )
 
 const interruptedStreamPair = "data: {\"error\":{\"message\":\"oc-zen: upstream stream interrupted\",\"type\":\"upstream_interrupted\"}}\n\ndata: [DONE]\n\n"
@@ -38,7 +38,7 @@ func newUpstreamClient() *http.Client {
 		ExpectContinueTimeout: expectContinueTimeout,
 		MaxIdleConns:          maxIdleConns,
 		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
-		ForceAttemptHTTP2:     false,
+		ForceAttemptHTTP2:     true,
 	}
 	return &http.Client{Transport: transport}
 }
@@ -197,12 +197,12 @@ func (s *sseDoneWriter) Write(p []byte) (int, error) {
 		if isSSEDone(written) || (len(s.tail) > 0 && isSSEDone(append(s.tail, written...))) {
 			s.sawDone = true
 		}
-		if len(written) >= 32 {
-			s.tail = append(s.tail[:0], written[len(written)-32:]...)
+		if len(written) >= 64 {
+			s.tail = append(s.tail[:0], written[len(written)-64:]...)
 		} else {
 			s.tail = append(s.tail, written...)
-			if len(s.tail) > 32 {
-				s.tail = s.tail[len(s.tail)-32:]
+			if len(s.tail) > 64 {
+				s.tail = s.tail[len(s.tail)-64:]
 			}
 		}
 	}
@@ -210,5 +210,10 @@ func (s *sseDoneWriter) Write(p []byte) (int, error) {
 }
 
 func isSSEDone(b []byte) bool {
-	return bytes.Contains(b, []byte("data: [DONE]")) || bytes.Contains(b, []byte("data:[DONE]"))
+	return bytes.Contains(b, []byte("data: [DONE]")) ||
+		bytes.Contains(b, []byte("data:[DONE]")) ||
+		bytes.Contains(b, []byte(`"finish_reason":"stop"`)) ||
+		bytes.Contains(b, []byte(`"finish_reason":"length"`)) ||
+		bytes.Contains(b, []byte(`"finish_reason":"tool_calls"`)) ||
+		bytes.Contains(b, []byte(`"response.completed"`))
 }

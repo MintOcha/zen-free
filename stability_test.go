@@ -372,3 +372,54 @@ func TestProxyHandlerPassThroughNoInterruptionAfterDone(t *testing.T) {
 		t.Fatalf("stream DONE frame count = %d, want exactly 1: %q", strings.Count(recorder.Body.String(), "data: [DONE]\n\n"), recorder.Body.String())
 	}
 }
+func TestRetryableStatusExpanded(t *testing.T) {
+	retryable := []int{408, 429, 500, 502, 503, 504, 520, 521, 522, 524, 599}
+	for _, code := range retryable {
+		if !retryableStatus(code) {
+			t.Errorf("status %d should be retryable", code)
+		}
+	}
+	notRetryable := []int{200, 201, 400, 401, 403, 404, 422}
+	for _, code := range notRetryable {
+		if retryableStatus(code) {
+			t.Errorf("status %d should not be retryable", code)
+		}
+	}
+}
+
+func TestExponentialRetryBackoff(t *testing.T) {
+	setStabilityTestKnobs(t)
+	retryBackoffs = []time.Duration{10 * time.Millisecond, 20 * time.Millisecond}
+	retryAfterCap = 500 * time.Millisecond
+
+	d1 := retryDelay(1, nil, 0)
+	d2 := retryDelay(2, nil, 0)
+	d3 := retryDelay(3, nil, 0)
+	d4 := retryDelay(4, nil, 0)
+
+	if d1 != 10*time.Millisecond || d2 != 20*time.Millisecond {
+		t.Fatalf("unexpected initial backoffs: d1=%v d2=%v", d1, d2)
+	}
+	if d3 != 40*time.Millisecond || d4 != 80*time.Millisecond {
+		t.Fatalf("unexpected exponential backoffs: d3=%v d4=%v", d3, d4)
+	}
+}
+
+func TestIsSSEDoneCompletionMarkers(t *testing.T) {
+	markers := [][]byte{
+		[]byte("data: [DONE]"),
+		[]byte("data:[DONE]"),
+		[]byte(`{"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}`),
+		[]byte(`{"choices":[{"delta":{"content":""},"finish_reason":"length"}]}`),
+		[]byte(`{"choices":[{"delta":{"content":""},"finish_reason":"tool_calls"}]}`),
+		[]byte(`{"type":"response.completed"}`),
+	}
+	for _, m := range markers {
+		if !isSSEDone(m) {
+			t.Errorf("expected marker to be detected as done: %s", string(m))
+		}
+	}
+	if isSSEDone([]byte(`{"choices":[{"delta":{"content":"thinking..."}}]}`)) {
+		t.Error("in-flight chunk should not be detected as done")
+	}
+}

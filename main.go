@@ -487,7 +487,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 }
 
 func retryableStatus(status int) bool {
-	return status == 429 || status == 500 || status == 502 || status == 503 || status == 504
+	return status == 429 || status == 408 || (status >= 500 && status <= 599)
 }
 
 func retryLog(attempt int, reason, session string) {
@@ -496,8 +496,17 @@ func retryLog(attempt int, reason, session string) {
 
 func retryDelay(attempt int, header http.Header, status int) time.Duration {
 	delay := time.Duration(0)
-	if attempt-1 < len(retryBackoffs) {
-		delay = retryBackoffs[attempt-1]
+	if attempt > 0 {
+		if attempt-1 < len(retryBackoffs) {
+			delay = retryBackoffs[attempt-1]
+		} else if len(retryBackoffs) > 0 {
+			step := attempt - len(retryBackoffs)
+			multiplier := time.Duration(1 << uint(step))
+			delay = retryBackoffs[len(retryBackoffs)-1] * multiplier
+			if delay > 15*time.Second {
+				delay = 15 * time.Second
+			}
+		}
 	}
 	if status == http.StatusTooManyRequests && header != nil {
 		if value := header.Get("Retry-After"); value != "" {
@@ -550,13 +559,35 @@ func envSeconds(name string, fallback time.Duration) time.Duration {
 	}
 	return time.Duration(seconds) * time.Second
 }
+func envInt(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(value)
+	if err != nil || v <= 0 {
+		log.Printf("invalid %s=%q, keeping %d", name, value, fallback)
+		return fallback
+	}
+	return v
+}
 
-func main() {
+func initStabilityKnobs() {
 	retryLoopBudget = envSeconds("ZEN_RETRY_BUDGET", retryLoopBudget)
 	if responseHeaderTimeout < retryLoopBudget {
 		responseHeaderTimeout = retryLoopBudget
 	}
-	log.Printf("retry budget=%s response header timeout=%s", retryLoopBudget, responseHeaderTimeout)
+	responseHeaderTimeout = envSeconds("ZEN_RESPONSE_HEADER_TIMEOUT", responseHeaderTimeout)
+	upstreamIdleTimeout = envSeconds("ZEN_IDLE_TIMEOUT", upstreamIdleTimeout)
+	clientKeepAliveInterval = envSeconds("ZEN_KEEPALIVE_INTERVAL", clientKeepAliveInterval)
+	maxAttempts = envInt("ZEN_MAX_ATTEMPTS", maxAttempts)
+	retryAfterCap = envSeconds("ZEN_RETRY_AFTER_CAP", retryAfterCap)
+	log.Printf("retry budget=%s response header timeout=%s idle timeout=%s keepalive=%s max attempts=%d retry after cap=%s",
+		retryLoopBudget, responseHeaderTimeout, upstreamIdleTimeout, clientKeepAliveInterval, maxAttempts, retryAfterCap)
+}
+
+func main() {
+	initStabilityKnobs()
 
 	mint := &idMint{}
 	client := newUpstreamClient()
