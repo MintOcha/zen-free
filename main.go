@@ -467,7 +467,11 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 }
 
 func retryableStatus(status int) bool {
-	return status == 429 || status == 408 || (status >= 500 && status <= 599)
+	switch status {
+	case 408, 429, 500, 502, 503, 504, 599:
+		return true
+	}
+	return status >= 520 && status <= 527
 }
 
 func retryLog(attempt int, reason, session string) {
@@ -481,6 +485,9 @@ func retryDelay(attempt int, header http.Header, status int) time.Duration {
 			delay = retryBackoffs[attempt-1]
 		} else if len(retryBackoffs) > 0 {
 			step := attempt - len(retryBackoffs)
+			if step > 10 {
+				step = 10
+			}
 			multiplier := time.Duration(1 << uint(step))
 			delay = retryBackoffs[len(retryBackoffs)-1] * multiplier
 			if delay > 15*time.Second {
@@ -554,16 +561,18 @@ func envInt(name string, fallback int) int {
 
 func initStabilityKnobs() {
 	retryLoopBudget = envSeconds("ZEN_RETRY_BUDGET", retryLoopBudget)
+	responseHeaderTimeout = envSeconds("ZEN_RESPONSE_HEADER_TIMEOUT", responseHeaderTimeout)
 	if responseHeaderTimeout < retryLoopBudget {
 		responseHeaderTimeout = retryLoopBudget
 	}
-	responseHeaderTimeout = envSeconds("ZEN_RESPONSE_HEADER_TIMEOUT", responseHeaderTimeout)
 	upstreamIdleTimeout = envSeconds("ZEN_IDLE_TIMEOUT", upstreamIdleTimeout)
 	clientKeepAliveInterval = envSeconds("ZEN_KEEPALIVE_INTERVAL", clientKeepAliveInterval)
 	maxAttempts = envInt("ZEN_MAX_ATTEMPTS", maxAttempts)
 	retryAfterCap = envSeconds("ZEN_RETRY_AFTER_CAP", retryAfterCap)
-	log.Printf("retry budget=%s response header timeout=%s idle timeout=%s keepalive=%s max attempts=%d retry after cap=%s",
-		retryLoopBudget, responseHeaderTimeout, upstreamIdleTimeout, clientKeepAliveInterval, maxAttempts, retryAfterCap)
+	maxSSELineBytes = envInt("ZEN_MAX_SSE_LINE_BYTES", maxSSELineBytes)
+	sseErrorScanWindow = envInt("ZEN_SSE_ERROR_SCAN_WINDOW", sseErrorScanWindow)
+	log.Printf("retry budget=%s response header timeout=%s idle timeout=%s keepalive=%s max attempts=%d retry after cap=%s max sse line=%d error scan window=%d",
+		retryLoopBudget, responseHeaderTimeout, upstreamIdleTimeout, clientKeepAliveInterval, maxAttempts, retryAfterCap, maxSSELineBytes, sseErrorScanWindow)
 }
 
 func main() {

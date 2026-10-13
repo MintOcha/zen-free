@@ -55,7 +55,7 @@ func aggregateResponsesStream(body io.Reader) (map[string]any, error) {
 		return nil
 	}
 	for {
-		line, readErr := reader.ReadString('\n')
+		line, readErr := readSSELine(reader)
 		if len(line) > 0 {
 			trimmed := strings.TrimRight(line, "\r\n")
 			if trimmed == "" {
@@ -71,6 +71,9 @@ func aggregateResponsesStream(body io.Reader) (map[string]any, error) {
 			}
 		}
 		if readErr != nil {
+			if errors.Is(readErr, errSSELineTooLong) {
+				return nil, readErr
+			}
 			if !errors.Is(readErr, io.EOF) {
 				scanErr = readErr
 			}

@@ -420,7 +420,7 @@ func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model 
 		return process(payload)
 	}
 	for {
-		line, readErr := reader.ReadString('\n')
+		line, readErr := readSSELine(reader)
 		if len(line) > 0 {
 			trimmed := strings.TrimRight(line, "\r\n")
 			if trimmed == "" {
@@ -439,6 +439,12 @@ func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model 
 			}
 		}
 		if readErr != nil {
+			if errors.Is(readErr, errSSELineTooLong) {
+				if streaming && !state.contentSent {
+					return http.StatusBadGateway, true
+				}
+				return writeSSEFailure(w, streaming, "upstream response failed"), false
+			}
 			if !errors.Is(readErr, io.EOF) {
 				scanErr = readErr
 			}

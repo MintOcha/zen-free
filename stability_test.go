@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
 	"net/http"
@@ -508,5 +510,187 @@ func TestIsSSEErrorAndHasSSEData(t *testing.T) {
 	}
 	if !hasSSEData([]byte("data: {\"id\":\"1\"}\n\n")) {
 		t.Error("data line must be detected as data")
+	}
+}
+
+func TestInitKnobsHeaderTimeoutNeverBelowBudget(t *testing.T) {
+	origBudget := retryLoopBudget
+	origHeader := responseHeaderTimeout
+	t.Cleanup(func() {
+		retryLoopBudget = origBudget
+		responseHeaderTimeout = origHeader
+	})
+	t.Setenv("ZEN_RETRY_BUDGET", "300")
+	t.Setenv("ZEN_RESPONSE_HEADER_TIMEOUT", "10")
+	initStabilityKnobs()
+	if responseHeaderTimeout < retryLoopBudget {
+		t.Fatalf("response header timeout %s below retry budget %s after init", responseHeaderTimeout, retryLoopBudget)
+	}
+}
+
+func TestRetryDelayNeverCollapses(t *testing.T) {
+	for _, attempt := range []int{64, 70, 100} {
+		d := retryDelay(attempt, nil, 0)
+		if d < 15*time.Second || d > 20*time.Second {
+			t.Errorf("attempt %d: delay %s outside [15s, 20s]", attempt, d)
+		}
+	}
+}
+
+func TestRetryableStatusExcludesPermanentErrors(t *testing.T) {
+	for _, status := range []int{501, 505, 506} {
+		if retryableStatus(status) {
+			t.Errorf("status %d must not be retryable", status)
+		}
+	}
+	for status := 520; status <= 527; status++ {
+		if !retryableStatus(status) {
+			t.Errorf("status %d must be retryable", status)
+		}
+	}
+	for _, status := range []int{408, 429, 500, 502, 503, 504, 599} {
+		if !retryableStatus(status) {
+			t.Errorf("status %d must be retryable", status)
+		}
+	}
+}
+
+func TestPassThroughFlagsTruncationAfterItemDoneEvent(t *testing.T) {
+	setStabilityTestKnobs(t)
+	payload := "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"status\":\"completed\"}}\n\n"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)+100))
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, payload)
+	}))
+	defer upstream.Close()
+
+	recorder := serveStabilityRequest(upstream, `{"model":"gpt-4o","stream":true,"messages":[]}`, "text/event-stream")
+	body := recorder.Body.String()
+	if !strings.Contains(body, "response.output_item.done") {
+		t.Errorf("body missing item done event: %q", body)
+	}
+	if !strings.HasSuffix(body, stabilityInterruptedPair) {
+		t.Errorf("truncated stream must end with interrupted pair: %q", body)
+	}
+}
+
+func TestPassThroughNoFalseErrorOnEmbeddedErrorField(t *testing.T) {
+	setStabilityTestKnobs(t)
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call_output\",\"output\":{\"error\":{\"message\":\"nonfatal\"},\"ok\":true}}}\n\n")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	recorder := serveStabilityRequest(upstream, `{"model":"gpt-4o","stream":true,"messages":[]}`, "text/event-stream")
+	body := recorder.Body.String()
+	if got := hits.Load(); got != 1 {
+		t.Errorf("upstream hits = %d, want 1 (no retry for embedded error field)", got)
+	}
+	if recorder.Code != http.StatusOK {
+		t.Errorf("code = %d, want 200", recorder.Code)
+	}
+	if !strings.Contains(body, `"content":"hello"`) {
+		t.Errorf("body missing streamed content: %q", body)
+	}
+	if got := strings.Count(body, "data: [DONE]\n\n"); got != 1 {
+		t.Errorf("DONE count = %d, want 1", got)
+	}
+}
+
+func TestAggregateChatStreamRejectsOversizedLine(t *testing.T) {
+	oldLimit := maxSSELineBytes
+	t.Cleanup(func() { maxSSELineBytes = oldLimit })
+	maxSSELineBytes = 1024
+	stream := "data: " + strings.Repeat("x", 4096) + "\n\n"
+	_, err := aggregateChatStream(strings.NewReader(stream), "test-model")
+	if err == nil {
+		t.Fatal("expected oversized SSE line to fail, got nil error")
+	}
+	if !strings.Contains(err.Error(), "SSE line exceeds") {
+		t.Fatalf("error = %v, want clear oversized-line error", err)
+	}
+}
+
+func TestInitKnobsMaxSSELineBytes(t *testing.T) {
+	old := maxSSELineBytes
+	t.Cleanup(func() { maxSSELineBytes = old })
+	t.Setenv("ZEN_MAX_SSE_LINE_BYTES", "4096")
+	initStabilityKnobs()
+	if maxSSELineBytes != 4096 {
+		t.Fatalf("maxSSELineBytes = %d, want 4096", maxSSELineBytes)
+	}
+}
+
+func TestProxyHandlerRetriesErrorEventBeyondFirstRead(t *testing.T) {
+	setStabilityTestKnobs(t)
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits.Add(1) == 1 {
+			padding := strings.Repeat("data: "+strings.Repeat("p", 96)+"\n\n", 64) // >4096 bytes
+			_, _ = io.WriteString(w, padding)
+			_, _ = io.WriteString(w, "event: error\ndata: {\"error\":{\"message\":\"late failure\",\"type\":\"server_error\"}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	recorder := serveStabilityRequest(upstream, `{"model":"gpt-4o","stream":true,"messages":[]}`, "text/event-stream")
+	if hits.Load() != 2 {
+		t.Fatalf("upstream hits = %d, want 2 (error event beyond first 4096-byte read must be caught)", hits.Load())
+	}
+	if !strings.Contains(recorder.Body.String(), `"content":"recovered"`) {
+		t.Fatalf("expected recovered payload, got: %s", recorder.Body.String())
+	}
+}
+
+func TestRelayPassThroughStreamReturnsUpstreamStatus(t *testing.T) {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp := &http.Response{
+		StatusCode: http.StatusUnauthorized,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("data: {\"id\":\"x\"}\n\n")),
+	}
+	status, retryable := relayPassThroughStream(rec, req, resp, "ses-status-test")
+	if retryable {
+		t.Fatal("401 pass-through must not be flagged retryable")
+	}
+	if status != http.StatusUnauthorized {
+		t.Fatalf("returned status = %d, want upstream 401 (log propagation)", status)
+	}
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("client status = %d, want 401 (client must still receive upstream status)", rec.Code)
+	}
+}
+
+func TestUpstreamClientNegotiatesHTTP2(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	client := newUpstreamClient()
+	transport := client.Transport.(*http.Transport)
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	transport.TLSClientConfig = &tls.Config{RootCAs: pool}
+
+	resp, err := client.Get(server.URL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.ProtoMajor != 2 {
+		t.Fatalf("negotiated %s, want HTTP/2 (ForceAttemptHTTP2 must keep h2 despite custom DialContext)", resp.Proto)
 	}
 }
