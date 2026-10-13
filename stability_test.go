@@ -326,3 +326,49 @@ func TestProxyHandlerKeepsMuseStreamAliveUntilContent(t *testing.T) {
 		t.Fatalf("stream did not continue to a complete answer after keep-alive: %q", recorder.Body.String())
 	}
 }
+
+func TestProxyHandlerStreamExceedsRetryBudget(t *testing.T) {
+	setStabilityTestKnobs(t)
+	retryLoopBudget = 40 * time.Millisecond
+	upstreamIdleTimeout = 2 * time.Second
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		time.Sleep(100 * time.Millisecond)
+		_, _ = io.WriteString(w, "data: long-output\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	recorder := serveStabilityRequest(upstream, `{"model":"gpt-4o","stream":true,"messages":[]}`, "text/event-stream")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "data: long-output\n\n") || !strings.HasSuffix(recorder.Body.String(), "data: [DONE]\n\n") {
+		t.Fatalf("stream truncated by retry budget: %q", recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), "upstream_interrupted") {
+		t.Fatalf("stream contains upstream_interrupted error: %q", recorder.Body.String())
+	}
+}
+
+func TestProxyHandlerPassThroughNoInterruptionAfterDone(t *testing.T) {
+	setStabilityTestKnobs(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: final\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	recorder := serveStabilityRequest(upstream, `{"model":"gpt-4o","stream":true,"messages":[]}`, "text/event-stream")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	if strings.Contains(recorder.Body.String(), "upstream_interrupted") {
+		t.Fatalf("stream unexpectedly received interruption error after DONE: %q", recorder.Body.String())
+	}
+	if strings.Count(recorder.Body.String(), "data: [DONE]\n\n") != 1 {
+		t.Fatalf("stream DONE frame count = %d, want exactly 1: %q", strings.Count(recorder.Body.String(), "data: [DONE]\n\n"), recorder.Body.String())
+	}
+}

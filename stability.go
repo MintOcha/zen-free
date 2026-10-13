@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
@@ -181,4 +182,33 @@ func (s *serializedStreamWriter) Flush() {
 func (s *serializedStreamWriter) Close() {
 	close(s.stop)
 	<-s.done
+}
+
+type sseDoneWriter struct {
+	w       io.Writer
+	sawDone bool
+	tail    []byte
+}
+
+func (s *sseDoneWriter) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	if !s.sawDone && n > 0 {
+		written := p[:n]
+		if isSSEDone(written) || (len(s.tail) > 0 && isSSEDone(append(s.tail, written...))) {
+			s.sawDone = true
+		}
+		if len(written) >= 32 {
+			s.tail = append(s.tail[:0], written[len(written)-32:]...)
+		} else {
+			s.tail = append(s.tail, written...)
+			if len(s.tail) > 32 {
+				s.tail = s.tail[len(s.tail)-32:]
+			}
+		}
+	}
+	return n, err
+}
+
+func isSSEDone(b []byte) bool {
+	return bytes.Contains(b, []byte("data: [DONE]")) || bytes.Contains(b, []byte("data:[DONE]"))
 }
