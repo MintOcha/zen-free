@@ -309,14 +309,20 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				finalErr = err
 				break
 			}
-			out, reqErr := http.NewRequestWithContext(loopCtx, r.Method, target, bytes.NewReader(bodyBytes))
+			attemptCtx, cancelAttempt := context.WithCancel(r.Context())
+			stopAttempt := context.AfterFunc(loopCtx, cancelAttempt)
+			out, reqErr := http.NewRequestWithContext(attemptCtx, r.Method, target, bytes.NewReader(bodyBytes))
 			if reqErr != nil {
+				stopAttempt()
+				cancelAttempt()
 				finalErr = reqErr
 				break
 			}
 			out.Header, out.ContentLength = headers.Clone(), contentLength
 			resp, doErr := client.Do(out)
+			stopAttempt()
 			if doErr != nil {
+				cancelAttempt()
 				finalErr = doErr
 				if r.Context().Err() != nil || attempt == maxAttempts || loopCtx.Err() != nil {
 					break
@@ -331,6 +337,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				finalErr = fmt.Errorf("upstream status %d", resp.StatusCode)
 				delay := retryDelay(attempt, resp.Header, resp.StatusCode)
 				_ = resp.Body.Close()
+				cancelAttempt()
 				if attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, delay) {
 					retryLog(attempt, "status", session)
 					continue
@@ -346,6 +353,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 					resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
 					attemptStatus, retryable := writeResponsesAsChat(writer, resp, requestedModel, true, replay)
 					_ = resp.Body.Close()
+					cancelAttempt()
 					writer.Close()
 					status = attemptStatus
 					if retryable && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
@@ -363,6 +371,8 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 					}
 				}
 				status, _ = writeResponsesAsChat(w, resp, requestedModel, false, replay)
+				_ = resp.Body.Close()
+				cancelAttempt()
 				return
 			}
 			isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
@@ -398,6 +408,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				n, readErr := resp.Body.Read(first)
 				if n == 0 && readErr != nil {
 					_ = resp.Body.Close()
+					cancelAttempt()
 					writer.Close()
 					if attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 						retryLog(attempt, "empty_stream", session)
@@ -410,23 +421,25 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 					return
 				}
 				w.WriteHeader(status)
+				doneWriter := &sseDoneWriter{w: writer}
 				written, writeErr := 0, error(nil)
 				if n > 0 {
-					count, err := writer.Write(first[:n])
+					count, err := doneWriter.Write(first[:n])
 					written += count
 					writeErr = err
 				}
 				if readErr == nil && writeErr == nil {
-					count, err := io.Copy(writer, resp.Body)
+					count, err := io.Copy(doneWriter, resp.Body)
 					written += int(count)
 					writeErr = err
 				} else if readErr != io.EOF {
 					writeErr = readErr
 				}
 				_ = resp.Body.Close()
+				cancelAttempt()
 				writer.Close()
-				if writeErr != nil {
-					log.Printf("stream_interrupted bytes_written=%d ses=%s", written, session)
+				if writeErr != nil && !doneWriter.sawDone && r.Context().Err() == nil {
+					log.Printf("stream_interrupted bytes_written=%d err=%v ses=%s", written, writeErr, session)
 					_, _ = io.WriteString(w, interruptedStreamPair)
 				}
 				return
@@ -434,6 +447,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 			w.WriteHeader(status)
 			_, _ = io.Copy(flushWriter{w}, resp.Body)
 			_ = resp.Body.Close()
+			cancelAttempt()
 			return
 		}
 		if streaming {
