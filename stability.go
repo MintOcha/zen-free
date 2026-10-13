@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -15,7 +18,7 @@ var (
 	dialTimeout             = 15 * time.Second
 	tlsHandshakeTimeout     = 10 * time.Second
 	responseHeaderTimeout   = 300 * time.Second
-	idleConnTimeout         = 90 * time.Second
+	idleConnTimeout         = 50 * time.Second
 	expectContinueTimeout   = 1 * time.Second
 	maxIdleConns            = 32
 	maxIdleConnsPerHost     = 16
@@ -31,7 +34,10 @@ const interruptedStreamPair = "data: {\"error\":{\"message\":\"oc-zen: upstream 
 
 func newUpstreamClient() *http.Client {
 	transport := &http.Transport{
-		DialContext:           (&net.Dialer{Timeout: dialTimeout}).DialContext,
+		DialContext: (&net.Dialer{
+			Timeout:   dialTimeout,
+			KeepAlive: 15 * time.Second,
+		}).DialContext,
 		TLSHandshakeTimeout:   tlsHandshakeTimeout,
 		ResponseHeaderTimeout: responseHeaderTimeout,
 		IdleConnTimeout:       idleConnTimeout,
@@ -213,7 +219,123 @@ func isSSEDone(b []byte) bool {
 	return bytes.Contains(b, []byte("data: [DONE]")) ||
 		bytes.Contains(b, []byte("data:[DONE]")) ||
 		bytes.Contains(b, []byte(`"finish_reason":"stop"`)) ||
+		bytes.Contains(b, []byte(`"finish_reason": "stop"`)) ||
 		bytes.Contains(b, []byte(`"finish_reason":"length"`)) ||
+		bytes.Contains(b, []byte(`"finish_reason": "length"`)) ||
 		bytes.Contains(b, []byte(`"finish_reason":"tool_calls"`)) ||
-		bytes.Contains(b, []byte(`"response.completed"`))
+		bytes.Contains(b, []byte(`"finish_reason": "tool_calls"`)) ||
+		bytes.Contains(b, []byte(`"finish_reason":"content_filter"`)) ||
+		bytes.Contains(b, []byte(`"finish_reason": "content_filter"`)) ||
+		bytes.Contains(b, []byte(`"response.completed"`)) ||
+		bytes.Contains(b, []byte(`"status":"completed"`)) ||
+		bytes.Contains(b, []byte(`"status": "completed"`))
+}
+
+func isSSEError(b []byte) bool {
+	if bytes.Contains(b, []byte(`event: error`)) || bytes.Contains(b, []byte(`event:error`)) {
+		return true
+	}
+	if bytes.Contains(b, []byte(`"error":{`)) || bytes.Contains(b, []byte(`"error": {`)) {
+		return true
+	}
+	if bytes.Contains(b, []byte(`"type":"response.failed"`)) || bytes.Contains(b, []byte(`"type": "response.failed"`)) {
+		return true
+	}
+	return false
+}
+
+func hasSSEData(b []byte) bool {
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("data:")) {
+			val := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if len(val) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type clientWriteTracker struct {
+	w        io.Writer
+	writeErr error
+}
+
+func (c *clientWriteTracker) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	if err != nil && c.writeErr == nil {
+		c.writeErr = err
+	}
+	return n, err
+}
+
+func isClientDisconnect(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "broken pipe") || strings.Contains(s, "connection reset") || strings.Contains(s, "closed network connection")
+}
+
+func relayPassThroughStream(w http.ResponseWriter, r *http.Request, resp *http.Response, session string) (int, bool) {
+	resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
+	defer resp.Body.Close()
+
+	buf := make([]byte, 4096)
+	n, readErr := resp.Body.Read(buf)
+	if n == 0 && readErr != nil {
+		return http.StatusBadGateway, true
+	}
+
+	prelude := buf[:n]
+	if isSSEError(prelude) {
+		return http.StatusBadGateway, true
+	}
+	if readErr != nil && !hasSSEData(prelude) {
+		return http.StatusBadGateway, true
+	}
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	writer := newSerializedStreamWriter(w, clientKeepAliveInterval)
+	defer writer.Close()
+
+	w.WriteHeader(resp.StatusCode)
+
+	tracker := &clientWriteTracker{w: writer}
+	doneWriter := &sseDoneWriter{w: tracker}
+
+	written, writeErr := 0, error(nil)
+	if n > 0 {
+		count, err := doneWriter.Write(prelude)
+		written += count
+		writeErr = err
+	}
+
+	if readErr == nil && writeErr == nil {
+		count, err := io.Copy(doneWriter, resp.Body)
+		written += int(count)
+		writeErr = err
+	} else if readErr != io.EOF && writeErr == nil {
+		writeErr = readErr
+	}
+
+	if writeErr != nil && !doneWriter.sawDone {
+		if tracker.writeErr != nil || isClientDisconnect(writeErr) {
+			log.Printf("client_disconnected bytes_written=%d err=%v ses=%s", written, writeErr, session)
+			return http.StatusOK, false
+		}
+		if r.Context().Err() == nil {
+			log.Printf("stream_interrupted bytes_written=%d err=%v ses=%s", written, writeErr, session)
+			_, _ = io.WriteString(w, interruptedStreamPair)
+		}
+	}
+	return http.StatusOK, false
 }

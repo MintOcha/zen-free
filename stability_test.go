@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -421,5 +422,91 @@ func TestIsSSEDoneCompletionMarkers(t *testing.T) {
 	}
 	if isSSEDone([]byte(`{"choices":[{"delta":{"content":"thinking..."}}]}`)) {
 		t.Error("in-flight chunk should not be detected as done")
+	}
+}
+
+func TestProxyHandlerPassThroughRetriesEmptyStream(t *testing.T) {
+	setStabilityTestKnobs(t)
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits.Add(1) == 1 {
+			// Closed immediately with empty body
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"success\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	recorder := serveStabilityRequest(upstream, `{"model":"gpt-4o","stream":true,"messages":[]}`, "text/event-stream")
+	if hits.Load() != 2 {
+		t.Fatalf("upstream hits = %d, want 2 (retried empty stream)", hits.Load())
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("client status = %d body = %q", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"content":"success"`) {
+		t.Fatalf("expected success payload, got: %s", recorder.Body.String())
+	}
+}
+
+func TestProxyHandlerPassThroughRetriesErrorEventBeforeContent(t *testing.T) {
+	setStabilityTestKnobs(t)
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if hits.Add(1) == 1 {
+			// Emits an upstream error event before any completion content
+			_, _ = io.WriteString(w, "data: {\"error\":{\"message\":\"upstream overloaded\",\"type\":\"server_error\"}}\n\n")
+			return
+		}
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer upstream.Close()
+
+	recorder := serveStabilityRequest(upstream, `{"model":"gpt-4o","stream":true,"messages":[]}`, "text/event-stream")
+	if hits.Load() != 2 {
+		t.Fatalf("upstream hits = %d, want 2 (retried error event)", hits.Load())
+	}
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("client status = %d body = %q", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"content":"recovered"`) {
+		t.Fatalf("expected recovered payload, got: %s", recorder.Body.String())
+	}
+}
+
+func TestUncappedLineReaderLargeLines(t *testing.T) {
+	largeContent := strings.Repeat("x", 2*1024*1024) // 2MB string
+	rawChunk := fmt.Sprintf("data: {\"id\":\"large\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"%s\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n", largeContent)
+	parsed, err := aggregateChatStream(strings.NewReader(rawChunk), "test-model")
+	if err != nil {
+		t.Fatalf("aggregateChatStream failed on 2MB line: %v", err)
+	}
+	choices := array(t, parsed["choices"])
+	choice := object(t, choices[0])
+	message := object(t, choice["message"])
+	content := stringValue(message["content"])
+	if len(content) != len(largeContent) {
+		t.Fatalf("content len = %d, want %d", len(content), len(largeContent))
+	}
+}
+
+func TestIsSSEErrorAndHasSSEData(t *testing.T) {
+	if !isSSEError([]byte("data: {\"error\":{\"message\":\"fail\"}}\n\n")) {
+		t.Error("expected error event to be detected")
+	}
+	if !isSSEError([]byte("event: error\ndata: fail\n\n")) {
+		t.Error("expected event: error to be detected")
+	}
+	if isSSEError([]byte("data: {\"type\":\"response.created\",\"error\":null}\n\n")) {
+		t.Error("error: null must not be treated as error")
+	}
+
+	if hasSSEData([]byte(": keep-alive\n\n: ping\n\n")) {
+		t.Error("comments must not be treated as data")
+	}
+	if !hasSSEData([]byte("data: {\"id\":\"1\"}\n\n")) {
+		t.Error("data line must be detected as data")
 	}
 }

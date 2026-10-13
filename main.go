@@ -197,6 +197,12 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		session, _ := r.Context().Value(contextKey{}).(string)
+		if session == "" {
+			session = r.Header.Get("x-opencode-session")
+		}
+		if session == "" {
+			session = mint.mint("ses_")
+		}
 		requestID := mint.mint("msg_")
 		status, attempts := http.StatusBadGateway, 0
 		defer func() {
@@ -420,55 +426,29 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				return
 			}
 
+			if streaming && isSSE {
+				attemptStatus, retryable := relayPassThroughStream(w, r, resp, session)
+				cancelAttempt()
+				status = attemptStatus
+				if retryable && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+					retryLog(attempt, "stream_before_content", session)
+					continue
+				}
+				if retryable {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusBadGateway)
+					_, _ = io.WriteString(w, interruptedStreamPair)
+					status = http.StatusBadGateway
+				}
+				return
+			}
+
 			for key, values := range resp.Header {
 				for _, value := range values {
 					w.Header().Add(key, value)
 				}
 			}
 			status = resp.StatusCode
-			if streaming && isSSE {
-				writer := newSerializedStreamWriter(w, clientKeepAliveInterval)
-				resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
-				first := make([]byte, 1)
-				n, readErr := resp.Body.Read(first)
-				if n == 0 && readErr != nil {
-					_ = resp.Body.Close()
-					cancelAttempt()
-					writer.Close()
-					if attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
-						retryLog(attempt, "empty_stream", session)
-						continue
-					}
-					w.Header().Set("Content-Type", "text/event-stream")
-					w.WriteHeader(http.StatusBadGateway)
-					_, _ = io.WriteString(w, interruptedStreamPair)
-					status = http.StatusBadGateway
-					return
-				}
-				w.WriteHeader(status)
-				doneWriter := &sseDoneWriter{w: writer}
-				written, writeErr := 0, error(nil)
-				if n > 0 {
-					count, err := doneWriter.Write(first[:n])
-					written += count
-					writeErr = err
-				}
-				if readErr == nil && writeErr == nil {
-					count, err := io.Copy(doneWriter, resp.Body)
-					written += int(count)
-					writeErr = err
-				} else if readErr != io.EOF {
-					writeErr = readErr
-				}
-				_ = resp.Body.Close()
-				cancelAttempt()
-				writer.Close()
-				if writeErr != nil && !doneWriter.sawDone && r.Context().Err() == nil {
-					log.Printf("stream_interrupted bytes_written=%d err=%v ses=%s", written, writeErr, session)
-					_, _ = io.WriteString(w, interruptedStreamPair)
-				}
-				return
-			}
 			w.WriteHeader(status)
 			_, _ = io.Copy(flushWriter{w}, resp.Body)
 			_ = resp.Body.Close()

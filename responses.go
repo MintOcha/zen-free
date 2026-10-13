@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -407,9 +408,9 @@ func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model 
 	}
 
 	defer upstream.Body.Close()
-	scanner := bufio.NewScanner(upstream.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	reader := bufio.NewReaderSize(upstream.Body, 64*1024)
 	var dataLines []string
+	var scanErr error
 	processEvent := func() error {
 		if len(dataLines) == 0 {
 			return nil
@@ -418,23 +419,30 @@ func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model 
 		dataLines = dataLines[:0]
 		return process(payload)
 	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			if err := processEvent(); err != nil {
-				if streaming && !state.contentSent {
-					return http.StatusBadGateway, true
+	for {
+		line, readErr := reader.ReadString('\n')
+		if len(line) > 0 {
+			trimmed := strings.TrimRight(line, "\r\n")
+			if trimmed == "" {
+				if err := processEvent(); err != nil {
+					if streaming && !state.contentSent {
+						return http.StatusBadGateway, true
+					}
+					return writeSSEFailure(w, streaming, "upstream response failed"), false
 				}
-				return writeSSEFailure(w, streaming, "upstream response failed"), false
+				if state.terminal {
+					break
+				}
+			} else if strings.HasPrefix(trimmed, "data:") {
+				value := strings.TrimPrefix(trimmed, "data:")
+				dataLines = append(dataLines, strings.TrimPrefix(value, " "))
 			}
-			if state.terminal {
-				break
-			}
-			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			value := strings.TrimPrefix(line, "data:")
-			dataLines = append(dataLines, strings.TrimPrefix(value, " "))
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				scanErr = readErr
+			}
+			break
 		}
 	}
 	if !state.terminal && len(dataLines) > 0 {
@@ -445,7 +453,7 @@ func writeResponsesAsChat(w http.ResponseWriter, upstream *http.Response, model 
 			return writeSSEFailure(w, streaming, "upstream response failed"), false
 		}
 	}
-	if scanner.Err() != nil || !state.terminal && state.failure == "" {
+	if scanErr != nil || !state.terminal && state.failure == "" {
 		if streaming && !state.contentSent {
 			return http.StatusBadGateway, true
 		}
