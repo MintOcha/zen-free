@@ -380,6 +380,7 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
 				completion, aggErr := aggregateChatStream(resp.Body, requestedModel)
 				_ = resp.Body.Close()
+				cancelAttempt()
 				if aggErr != nil {
 					if errors.Is(aggErr, errEmptyChatStream) && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
 						retryLog(attempt, "empty_chat_stream", session)
