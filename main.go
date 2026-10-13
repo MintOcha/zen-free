@@ -197,6 +197,12 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		session, _ := r.Context().Value(contextKey{}).(string)
+		if session == "" {
+			session = r.Header.Get("x-opencode-session")
+		}
+		if session == "" {
+			session = mint.mint("ses_")
+		}
 		requestID := mint.mint("msg_")
 		status, attempts := http.StatusBadGateway, 0
 		defer func() {
@@ -420,55 +426,29 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 				return
 			}
 
+			if streaming && isSSE {
+				attemptStatus, retryable := relayPassThroughStream(w, r, resp, session)
+				cancelAttempt()
+				status = attemptStatus
+				if retryable && attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
+					retryLog(attempt, "stream_before_content", session)
+					continue
+				}
+				if retryable {
+					w.Header().Set("Content-Type", "text/event-stream")
+					w.WriteHeader(http.StatusBadGateway)
+					_, _ = io.WriteString(w, interruptedStreamPair)
+					status = http.StatusBadGateway
+				}
+				return
+			}
+
 			for key, values := range resp.Header {
 				for _, value := range values {
 					w.Header().Add(key, value)
 				}
 			}
 			status = resp.StatusCode
-			if streaming && isSSE {
-				writer := newSerializedStreamWriter(w, clientKeepAliveInterval)
-				resp.Body = watchUpstreamBody(resp.Body, upstreamIdleTimeout, session)
-				first := make([]byte, 1)
-				n, readErr := resp.Body.Read(first)
-				if n == 0 && readErr != nil {
-					_ = resp.Body.Close()
-					cancelAttempt()
-					writer.Close()
-					if attempt < maxAttempts && r.Context().Err() == nil && waitRetry(loopCtx, retryDelay(attempt, nil, 0)) {
-						retryLog(attempt, "empty_stream", session)
-						continue
-					}
-					w.Header().Set("Content-Type", "text/event-stream")
-					w.WriteHeader(http.StatusBadGateway)
-					_, _ = io.WriteString(w, interruptedStreamPair)
-					status = http.StatusBadGateway
-					return
-				}
-				w.WriteHeader(status)
-				doneWriter := &sseDoneWriter{w: writer}
-				written, writeErr := 0, error(nil)
-				if n > 0 {
-					count, err := doneWriter.Write(first[:n])
-					written += count
-					writeErr = err
-				}
-				if readErr == nil && writeErr == nil {
-					count, err := io.Copy(doneWriter, resp.Body)
-					written += int(count)
-					writeErr = err
-				} else if readErr != io.EOF {
-					writeErr = readErr
-				}
-				_ = resp.Body.Close()
-				cancelAttempt()
-				writer.Close()
-				if writeErr != nil && !doneWriter.sawDone && r.Context().Err() == nil {
-					log.Printf("stream_interrupted bytes_written=%d err=%v ses=%s", written, writeErr, session)
-					_, _ = io.WriteString(w, interruptedStreamPair)
-				}
-				return
-			}
 			w.WriteHeader(status)
 			_, _ = io.Copy(flushWriter{w}, resp.Body)
 			_ = resp.Body.Close()
@@ -487,7 +467,11 @@ func proxyHandler(upstream string, client *http.Client, mint *idMint) http.Handl
 }
 
 func retryableStatus(status int) bool {
-	return status == 429 || status == 500 || status == 502 || status == 503 || status == 504
+	switch status {
+	case 408, 429, 500, 502, 503, 504, 599:
+		return true
+	}
+	return status >= 520 && status <= 527
 }
 
 func retryLog(attempt int, reason, session string) {
@@ -496,8 +480,20 @@ func retryLog(attempt int, reason, session string) {
 
 func retryDelay(attempt int, header http.Header, status int) time.Duration {
 	delay := time.Duration(0)
-	if attempt-1 < len(retryBackoffs) {
-		delay = retryBackoffs[attempt-1]
+	if attempt > 0 {
+		if attempt-1 < len(retryBackoffs) {
+			delay = retryBackoffs[attempt-1]
+		} else if len(retryBackoffs) > 0 {
+			step := attempt - len(retryBackoffs)
+			if step > 10 {
+				step = 10
+			}
+			multiplier := time.Duration(1 << uint(step))
+			delay = retryBackoffs[len(retryBackoffs)-1] * multiplier
+			if delay > 15*time.Second {
+				delay = 15 * time.Second
+			}
+		}
 	}
 	if status == http.StatusTooManyRequests && header != nil {
 		if value := header.Get("Retry-After"); value != "" {
@@ -550,13 +546,37 @@ func envSeconds(name string, fallback time.Duration) time.Duration {
 	}
 	return time.Duration(seconds) * time.Second
 }
+func envInt(name string, fallback int) int {
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	v, err := strconv.Atoi(value)
+	if err != nil || v <= 0 {
+		log.Printf("invalid %s=%q, keeping %d", name, value, fallback)
+		return fallback
+	}
+	return v
+}
 
-func main() {
+func initStabilityKnobs() {
 	retryLoopBudget = envSeconds("ZEN_RETRY_BUDGET", retryLoopBudget)
+	responseHeaderTimeout = envSeconds("ZEN_RESPONSE_HEADER_TIMEOUT", responseHeaderTimeout)
 	if responseHeaderTimeout < retryLoopBudget {
 		responseHeaderTimeout = retryLoopBudget
 	}
-	log.Printf("retry budget=%s response header timeout=%s", retryLoopBudget, responseHeaderTimeout)
+	upstreamIdleTimeout = envSeconds("ZEN_IDLE_TIMEOUT", upstreamIdleTimeout)
+	clientKeepAliveInterval = envSeconds("ZEN_KEEPALIVE_INTERVAL", clientKeepAliveInterval)
+	maxAttempts = envInt("ZEN_MAX_ATTEMPTS", maxAttempts)
+	retryAfterCap = envSeconds("ZEN_RETRY_AFTER_CAP", retryAfterCap)
+	maxSSELineBytes = envInt("ZEN_MAX_SSE_LINE_BYTES", maxSSELineBytes)
+	sseErrorScanWindow = envInt("ZEN_SSE_ERROR_SCAN_WINDOW", sseErrorScanWindow)
+	log.Printf("retry budget=%s response header timeout=%s idle timeout=%s keepalive=%s max attempts=%d retry after cap=%s max sse line=%d error scan window=%d",
+		retryLoopBudget, responseHeaderTimeout, upstreamIdleTimeout, clientKeepAliveInterval, maxAttempts, retryAfterCap, maxSSELineBytes, sseErrorScanWindow)
+}
+
+func main() {
+	initStabilityKnobs()
 
 	mint := &idMint{}
 	client := newUpstreamClient()

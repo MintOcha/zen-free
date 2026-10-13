@@ -115,8 +115,7 @@ func aggregateChatStream(body io.Reader, model string) (map[string]any, error) {
 		}
 		return false, nil
 	}
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	reader := bufio.NewReaderSize(body, 64*1024)
 	var dataLines []string
 	done := false
 	processEvent := func() error {
@@ -134,20 +133,31 @@ func aggregateChatStream(body io.Reader, model string) (map[string]any, error) {
 		}
 		return nil
 	}
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			if err := processEvent(); err != nil {
-				return nil, err
+	var scanErr error
+	for {
+		line, readErr := readSSELine(reader)
+		if len(line) > 0 {
+			trimmed := strings.TrimRight(line, "\r\n")
+			if trimmed == "" {
+				if err := processEvent(); err != nil {
+					return nil, err
+				}
+				if done {
+					break
+				}
+			} else if strings.HasPrefix(trimmed, "data:") {
+				value := strings.TrimPrefix(trimmed, "data:")
+				dataLines = append(dataLines, strings.TrimPrefix(value, " "))
 			}
-			if done {
-				break
-			}
-			continue
 		}
-		if strings.HasPrefix(line, "data:") {
-			value := strings.TrimPrefix(line, "data:")
-			dataLines = append(dataLines, strings.TrimPrefix(value, " "))
+		if readErr != nil {
+			if errors.Is(readErr, errSSELineTooLong) {
+				return nil, readErr
+			}
+			if !errors.Is(readErr, io.EOF) {
+				scanErr = readErr
+			}
+			break
 		}
 	}
 	if !done {
@@ -158,7 +168,7 @@ func aggregateChatStream(body io.Reader, model string) (map[string]any, error) {
 	if sawPayload == 0 {
 		return nil, errEmptyChatStream
 	}
-	if scanner.Err() != nil || (finish == "" && !done) {
+	if scanErr != nil || (finish == "" && !done) {
 		return nil, errChatStreamInterrupted
 	}
 	if role == "" {
